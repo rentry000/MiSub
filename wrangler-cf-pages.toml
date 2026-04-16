@@ -1,7 +1,7 @@
 name = "misub"
 type = "javascript"
 main = "src/index.js"
-compatibility_date = "2024-04-01"
+compatibility_date = "2024-09-23"
 
 # 🚀 Cloudflare Pages 部署配置
 # 这个配置用于部署到 Cloudflare Pages
