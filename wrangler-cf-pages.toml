@@ -8,7 +8,7 @@ compatibility_date = "2024-04-16"
 # 注意：Cloudflare Pages 会自动处理路由和绑定
 
 # Pages 特定配置
-build = { command = "npm run build", cwd = "./" }
+build = { command = "npm run build", cwd = "./dist" }
 main = "functions"
 
 # 不要设置 account_id 或 zone_id
