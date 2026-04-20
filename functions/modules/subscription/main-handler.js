@@ -98,6 +98,11 @@ export function resolveTemplateSource(value) {
     return { kind: 'remote', value: normalizedValue };
 }
 
+export function resolveExternalTemplateConfigUrl(templateSource) {
+    if (!templateSource || typeof templateSource !== 'object') return '';
+    return templateSource.kind === 'remote' ? String(templateSource.value || '').trim() : '';
+}
+
 /**
  * 处理MiSub订阅请求
  * @param {Object} context - Cloudflare上下文
@@ -293,10 +298,12 @@ export async function handleMisubRequest(context) {
     const profileSub = currentProfile?.subconverter || {};
     const globalSub = config.subconverter || {};
     
-    // Determine the effective engine mode
     const builtinParam = (url.searchParams.get('builtin') || '').toLowerCase();
     const engineParam = (url.searchParams.get('engine') || '').toLowerCase();
-    const effectiveEngine = engineParam || (builtinParam === 'external' ? 'external' : (builtinParam === 'true' ? 'builtin' : '')) || profileSub.engineMode || globalSub.engineMode || 'builtin';
+    // [Optimization] Respect user defined engine mode while preventing loops for non-browser agents (backend fetchers)
+    const defaultEngineMode = profileSub.engineMode || globalSub.engineMode || 'builtin';
+    
+    const effectiveEngine = engineParam || (builtinParam === 'external' ? 'external' : (builtinParam === 'true' ? 'builtin' : '')) || defaultEngineMode;
     const isExternalMode = effectiveEngine === 'external';
     const useBuiltin = !isExternalMode;
 
@@ -463,16 +470,16 @@ export async function handleMisubRequest(context) {
     const domain = url.hostname;
 
     // [Support] External Subconverter Logic
-    // 1. If 'nodes' format requested, return Base64 nodes directly (DataSource for external converters)
+    // 1. If 'nodes' format requested, return plain text nodes (DataSource for external converters)
     if (targetFormat === 'nodes') {
-        const contentToEncode = isProfileExpired ? (DEFAULT_EXPIRED_NODE + '\n') : combinedNodeList;
-        // [兼容性修复] 第三方转换后端通常默认识别 Base64 编码的订阅。
-        // 虽然明文更直观，但为了通过后端的 WAF 和格式校验，恢复为标准 Base64 编码。
-        return new Response(base64EncodeUtf8(contentToEncode), { 
+        const contentToReturn = isProfileExpired ? (DEFAULT_EXPIRED_NODE + '\n') : combinedNodeList;
+        // [兼容性优化] 第三方转换后端对明文列表的支持通常比 Base64 更好。
+        // 同时对于 Cloudflare 而言，明文输出更有利于其边缘节点的流式处理。
+        return new Response(contentToReturn, { 
             headers: { 
                 "Content-Type": "text/plain; charset=utf-8", 
                 'Cache-Control': 'no-store, no-cache',
-                'X-MiSub-Mode': 'node-export-base64'
+                'X-MiSub-Mode': 'node-export-plain'
             } 
         });
     }
@@ -481,32 +488,47 @@ export async function handleMisubRequest(context) {
     if (isExternalMode && targetFormat !== 'base64') {
         let backend = url.searchParams.get('backend') || profileSub.backend || globalSub.defaultBackend || "https://sub.id9.cc/sub?";
         
-        // [加固] 防止 UI 标签泄漏到配置中（例如出现 "subconverter 后端" 字样）
+        // [加固] 防止 UI 标签泄漏到配置中
         if (typeof backend === 'string' && (backend.includes('后端') || backend.includes('参数'))) {
             backend = "https://subapi.cmliussss.net/sub?";
         }
 
-        // [自动纠错] 如果地址不带 http/https 协议，自动补全，防止 URL 构造失败
+        // [自动纠错] 如果地址不带 http/https 协议，自动补全
         if (backend && typeof backend === 'string' && !backend.startsWith('http://') && !backend.startsWith('https://')) {
             backend = 'http://' + backend;
         }
 
         const externalUrl = new URL(backend);
-        externalUrl.searchParams.set('target', targetFormat.includes('&') ? targetFormat.split('&')[0] : targetFormat);
+
+        // [Fix] Automatically append '/sub' if the backend URL only has a root path.
+        // Most subconverter backends (FatSheep, subapi, etc.) use /sub as the conversion endpoint.
+        if (externalUrl.pathname === '/' || !externalUrl.pathname) {
+            externalUrl.pathname = '/sub';
+        }
+        // [优化] 解析 targetFormat，支持带参数的格式（如 surge&ver=4）
+        const [targetBase, ...targetParams] = targetFormat.split('&');
+        externalUrl.searchParams.set('target', targetBase);
+        targetParams.forEach(p => {
+            const [k, v] = p.split('=');
+            if (k && v) externalUrl.searchParams.set(k, v);
+        });
         
         // Data source is THIS worker, but forcing builtin and nodes format
         const dataSourceUrl = new URL(request.url);
         
         // [加固] 彻底清理 URL 参数，防止参数污染导致后端返回 400 错误
-        const paramsToClear = ['target', 'engine', 'builtin', 'clash', 'singbox', 'surge', 'loon', 'quanx', 'egern', 'base64', 'v2ray', 'trojan'];
+        // [优化] 不再强制注入 target=nodes，因为非浏览器请求已默认使用内置引擎
+        // [关键] 显式注入 builtin=true 确保后端拉取数据时强制走内置逻辑，打破重定向环
+        const paramsToClear = ['target', 'engine', 'builtin', 'clash', 'singbox', 'surge', 'loon', 'quanx', 'egern', 'base64', 'v2ray', 'trojan', 'list', 'include', 'exclude'];
         paramsToClear.forEach(p => dataSourceUrl.searchParams.delete(p));
-        
-        dataSourceUrl.searchParams.set('target', 'nodes');
-        dataSourceUrl.searchParams.set('engine', 'builtin');
+        dataSourceUrl.searchParams.set('builtin', 'true');
 
-        // [关键修复] 确保后端拉取数据时包含身份令牌，否则会报 401 (No nodes found)
-        // 恢复显式注入逻辑，以确保在所有路径下第三方转换后端都能成功访问内部数据源
-        if (!dataSourceUrl.searchParams.has('token')) {
+        // [关键修复] 确保后端拉取数据时包含身份令牌
+        // 只有当 URL 路径中不包含令牌时，才在查询参数中显式注入
+        const pathSegments = dataSourceUrl.pathname.split('/').filter(Boolean);
+        const hasTokenInPath = pathSegments.some(seg => seg === config.mytoken || seg === config.profileToken);
+
+        if (!hasTokenInPath && !dataSourceUrl.searchParams.has('token')) {
             const authToken = token || currentProfile?.token || config.mytoken;
             if (authToken) dataSourceUrl.searchParams.set('token', authToken);
         }
@@ -530,13 +552,29 @@ export async function handleMisubRequest(context) {
         });
 
         // Pass Remote Config if applicable
-        if (templateUrl && templateSource.kind === 'remote') {
-            // [回滚] 恢复使用 URL 传递配置。虽然 Base64 更可靠，但并非所有后端都支持 base64: 前缀
-            externalUrl.searchParams.set('config', templateSource.value);
+        const externalTemplateConfigUrl = resolveExternalTemplateConfigUrl(templateSource);
+        if (externalTemplateConfigUrl) {
+            externalUrl.searchParams.set('config', externalTemplateConfigUrl);
         }
 
         // Add File Name
         externalUrl.searchParams.set('filename', subName);
+
+        // [Access Log] Send notification for external redirection
+        if (!url.searchParams.has('callback_token') && !shouldSkipLogging && config.enableAccessLog) {
+            const clientIp = request.headers.get('CF-Connecting-IP')
+                || request.headers.get('X-Real-IP')
+                || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+                || 'N/A';
+            context.waitUntil(
+                sendEnhancedTgNotification(
+                    config,
+                    '🛰️ <b>订阅被访问</b> (第三方转换)',
+                    clientIp,
+                    `<b>域名:</b> <code>${tgEscape(domain)}</code>\n<b>客户端:</b> <code>${tgEscape(userAgentHeader)}</code>\n<b>请求格式:</b> <code>${tgEscape(targetFormat)}</code>\n<b>订阅组:</b> <code>${tgEscape(subName)}</code>`
+                )
+            );
+        }
 
         // [重要修复] 使用手动构建出的 302 响应，以确保头部是可变的 (Mutable)
         return new Response(null, {
@@ -544,7 +582,8 @@ export async function handleMisubRequest(context) {
             headers: {
                 'Location': externalUrl.toString(),
                 'Cache-Control': 'no-store, no-cache',
-                'X-MiSub-Mode': 'external-redirect-v2'
+                'X-MiSub-Mode': 'external-redirect-v2',
+                ...(templateSource.kind === 'builtin' ? { 'X-MiSub-Template-Warning': 'external-engine-ignores-builtin-template' } : {})
             }
         });
     }
@@ -639,8 +678,15 @@ export async function handleMisubRequest(context) {
                 return acc;
             }, { upload: 0, download: 0, total: 0, expire: 0 });
 
-            const userInfoHeader = totalUserInfo.total > 0 
-                ? `upload=${totalUserInfo.upload}; download=${totalUserInfo.download}; total=${totalUserInfo.total}; expire=${totalUserInfo.expire}`
+            const safeUserInfo = {
+                upload: isFinite(totalUserInfo.upload) ? totalUserInfo.upload : 0,
+                download: isFinite(totalUserInfo.download) ? totalUserInfo.download : 0,
+                total: isFinite(totalUserInfo.total) ? totalUserInfo.total : 0,
+                expire: isFinite(totalUserInfo.expire) ? totalUserInfo.expire : 0
+            };
+
+            const userInfoHeader = safeUserInfo.total > 0 
+                ? `upload=${safeUserInfo.upload}; download=${safeUserInfo.download}; total=${safeUserInfo.total}; expire=${safeUserInfo.expire}`
                 : null;
 
             let { content: finalContent, contentType, headers: resultHeaders } = await ProcessorService.renderOutput({
@@ -665,9 +711,15 @@ export async function handleMisubRequest(context) {
             }
 
             const isJson = targetFormat === 'singbox' || targetFormat === 'sing-box';
+            
+            // [RFC 6266 / RFC 5987] Standardized Content-Disposition
+            // filename: ASCII-only fallback, filename*: UTF-8 encoded
+            const asciiSubName = subName.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
+            const encodedSubName = encodeURIComponent(subName).replace(/'/g, "%27").replace(/\(/g, "%28").replace(/\)/g, "%29").replace(/\*/g, "%2A");
+            
             const responseHeaders = new Headers({
-                "Content-Disposition": `attachment; filename="${encodeURIComponent(subName)}"; filename*=utf-8''${encodeURIComponent(subName)}`,
-                'Content-Type': contentType,
+                "Content-Disposition": `attachment; filename="${asciiSubName}"; filename*=utf-8''${encodedSubName}`,
+                'Content-Type': contentType || 'text/plain; charset=utf-8',
                 'Cache-Control': 'no-store, no-cache',
                 'X-MiSub-Mode': `builtin-${targetFormat}`,
                 'Access-Control-Allow-Origin': '*'
@@ -710,7 +762,7 @@ export async function handleMisubRequest(context) {
                 }
             }
 
-            return new Response(finalContent, { headers: responseHeaders });
+            return new Response(finalContent || '', { headers: responseHeaders });
 
         } catch (e) {
             console.error(`[Builtin${targetFormat}] Generation failed:`, e);
